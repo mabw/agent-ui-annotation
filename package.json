@@ -30,13 +30,15 @@
     }
   },
   "files": [
-    "dist"
+    "dist",
+    "dist-cdn"
   ],
   "scripts": {
     "dev": "vite",
     "dev:demo": "vite --config vite.config.demo.ts",
     "build": "tsc && vite build",
     "build:demo": "vite build --config vite.config.demo.ts",
+    "build:cdn": "vite build --config vite.config.cdn.ts",
     "preview": "vite preview",
     "test": "vitest",
     "test:ui": "vitest --ui",

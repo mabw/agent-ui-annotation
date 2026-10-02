@@ -88,10 +88,11 @@ export const icons = {
 /**
  * Render collapsed toolbar
  */
-export function renderCollapsedToolbar(annotationCount: number): string {
+export function renderCollapsedToolbar(annotationCount: number, shortcut?: string): string {
+  const activateTitle = shortcut ? `${t('toolbar.activate')} (${shortcut})` : t('toolbar.activate');
   return `
-    <div class="toolbar collapsed" data-annotation-toolbar>
-      <button class="toolbar-btn toggle-btn" title="${t('toolbar.activate')}" data-action="toggle">
+    <div class="toolbar collapsed" data-annotation-toolbar popover="manual">
+      <button class="toolbar-btn toggle-btn" title="${activateTitle}" data-action="toggle">
         ${icons.annotation}
         ${annotationCount > 0 ? `<span class="badge">${annotationCount}</span>` : ''}
       </button>
@@ -138,7 +139,7 @@ export function renderExpandedToolbar(options: {
       : t('toolbar.showMarkers');
 
   return `
-    <div class="toolbar${showEntranceAnimation ? ' entering' : ''}" data-annotation-toolbar>
+    <div class="toolbar${showEntranceAnimation ? ' entering' : ''}" data-annotation-toolbar popover="manual">
       ${showCopiedFeedback ? `<div class="feedback success">${t('toolbar.copiedFeedback')}</div>` : ''}
       ${showClearedFeedback ? `<div class="feedback">${t('toolbar.clearedFeedback')}</div>` : ''}
       ${settingsPanelHtml}

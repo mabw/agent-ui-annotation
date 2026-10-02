@@ -2,7 +2,7 @@
  * Annotation Custom Element (Web Component) - Lit Version
  */
 
-import { LitElement, html, nothing } from 'lit';
+import { LitElement, html, nothing, render } from 'lit';
 import { unsafeHTML } from 'lit/directives/unsafe-html.js';
 import { ref, createRef, type Ref } from 'lit/directives/ref.js';
 import type { AppState, Settings, OutputLevel, ThemeMode, BeforeAnnotationCreateHook } from '../core/types';
@@ -61,6 +61,8 @@ export class AnnotationElement extends LitElement {
     outputLevel: { type: String, attribute: 'output-level' },
     annotationColor: { type: String, attribute: 'annotation-color' },
     disabled: { type: Boolean },
+    /** 激活/停用工具的全局快捷键，格式如 "alt+shift+a"（默认）。设为 "" 可禁用。 */
+    shortcut: { type: String, attribute: 'shortcut' },
   };
 
   // Public properties (from attributes)
@@ -69,6 +71,7 @@ export class AnnotationElement extends LitElement {
   declare outputLevel: OutputLevel;
   declare annotationColor: string;
   declare disabled: boolean;
+  declare shortcut: string;
 
   constructor() {
     super();
@@ -77,6 +80,7 @@ export class AnnotationElement extends LitElement {
     this.outputLevel = 'standard';
     this.annotationColor = '#AF52DE';
     this.disabled = false;
+    this.shortcut = 'alt+shift+a';
   }
 
   // Core controller
@@ -107,6 +111,7 @@ export class AnnotationElement extends LitElement {
   private boundHandleScroll = () => this.handleScroll();
   private boundHandleToolbarPointerMove = (e: PointerEvent) => this.handleToolbarPointerMove(e);
   private boundHandleToolbarPointerUp = (e: PointerEvent) => this.handleToolbarPointerUp(e);
+  private boundHandleShortcut = (e: KeyboardEvent) => this.handleShortcut(e);
   private scrollRafPending = false;
 
   // Toolbar drag session (kept off the store so mid-drag hovers do not snap the toolbar)
@@ -127,6 +132,12 @@ export class AnnotationElement extends LitElement {
   private textareaRef: Ref<HTMLTextAreaElement> = createRef();
   private popupPosition: { left: number; top: number } | null = null;
   private currentRoute: string = getCurrentRoute();
+
+  // Popup portal：把标注弹窗 portal 到 document.body 下的独立 shadow 容器，
+  // 脱离 <agent-ui-annotation> 所在的层叠上下文，并配合 popover API 进入 top layer，
+  // 避免被应用的 modal（尤其原生 <dialog>.showModal()）盖住。
+  private popupPortal: HTMLDivElement | null = null;
+  private popupPortalShadow: ShadowRoot | null = null;
   private routeListenerCleanup: (() => void) | null = null;
   private devtoolsApi: DevtoolsApi | null = null;
 
@@ -169,6 +180,9 @@ export class AnnotationElement extends LitElement {
     document.addEventListener('click', this.boundHandleDocumentClick);
     window.addEventListener('resize', this.boundHandleResize);
     document.addEventListener('scroll', this.boundHandleScroll, { capture: true, passive: true });
+    // 全局快捷键：always-on（工具未激活时也响应），用快捷键激活/停用工具不会触发 pointerdown，
+    // 因此不会让应用的 outside-click 弹层关闭、丢失标注目标。
+    document.addEventListener('keydown', this.boundHandleShortcut, true);
 
     // Initial state
     this.appState = this.core.store.getState();
@@ -199,9 +213,12 @@ export class AnnotationElement extends LitElement {
     document.removeEventListener('scroll', this.boundHandleScroll, true);
     document.removeEventListener('mousemove', this.boundHandleMouseMove);
     document.removeEventListener('click', this.boundHandleDocumentClick);
+    document.removeEventListener('keydown', this.boundHandleShortcut, true);
     this.teardownToolbarDrag();
 
     this.teardownPopupObserver();
+
+    this.destroyPopupPortal();
 
     if (this.core) {
       this.core.destroy();
@@ -230,12 +247,28 @@ export class AnnotationElement extends LitElement {
       this.core.deactivate();
     }
 
-    // Focus textarea when popup opens
-    if (this.appState?.popupVisible && this.textareaRef.value) {
-      this.textareaRef.value.focus();
-    }
+    // popup 渲染在 portal（document.body 下的独立 shadow），脱离 host 层叠上下文。
+    // 在主 render() 完成后同步渲染 popup 进 portal。
+    this.renderPopupIntoPortal();
 
-    this.syncPopupPosition();
+    // toolbar 也用 popover API 进入 top layer，避免被应用弹窗（modal/dialog）盖住。
+    this.showToolbarPopover();
+  }
+
+  /**
+   * 把 toolbar 通过 popover API 显示到 top layer，使其不被应用 modal/dialog 盖住。
+   * toolbar 模板根 div 已加 popover="manual"，需在每次渲染后调用 showPopover。
+   * 不支持 popover 的浏览器：属性被忽略，toolbar 仍按 position:fixed + z-index 显示。
+   */
+  private showToolbarPopover(): void {
+    const toolbar = this.renderRoot?.querySelector('.toolbar') as HTMLElement | null;
+    if (!toolbar) return;
+    if (typeof toolbar.showPopover !== 'function') return; // 不支持 popover，降级
+    try {
+      toolbar.showPopover();
+    } catch {
+      // 已在 top layer 或浏览器内部异常，忽略
+    }
   }
 
   /**
@@ -309,6 +342,37 @@ export class AnnotationElement extends LitElement {
 
   toggle() {
     this.core?.toggle();
+  }
+
+  /**
+   * 全局快捷键处理：always-on（工具未激活时也响应）。
+   * 用快捷键激活/停用工具不会触发 pointerdown/click，因此不会让应用的 outside-click
+   * 弹层关闭，避免"激活工具瞬间丢失标注目标"。
+   * 默认 Alt+Shift+A，可通过 `shortcut` 属性配置（如 "ctrl+shift+k"）；设为 "" 禁用。
+   */
+  private handleShortcut(event: KeyboardEvent): void {
+    if (!this.core) return;
+    const spec = this.shortcut?.trim().toLowerCase();
+    if (!spec) return; // 显式禁用
+
+    const parts = spec.split('+').map((p) => p.trim()).filter(Boolean);
+    const key = parts[parts.length - 1];
+    if (!key) return;
+
+    const needAlt = parts.includes('alt');
+    const needCtrl = parts.includes('ctrl') || parts.includes('cmd') || parts.includes('mod');
+    const needShift = parts.includes('shift');
+    const needMeta = parts.includes('meta');
+
+    if (event.altKey !== needAlt) return;
+    if (event.ctrlKey !== needCtrl && event.metaKey !== needCtrl) return;
+    if (event.shiftKey !== needShift) return;
+    if (event.metaKey !== needMeta) return;
+    if (event.key.toLowerCase() !== key) return;
+
+    event.preventDefault();
+    event.stopPropagation();
+    this.core.toggle();
   }
 
   async copyOutput(level?: OutputLevel): Promise<boolean> {
@@ -986,7 +1050,7 @@ export class AnnotationElement extends LitElement {
       this.settingsPanelAnimated = false;
       this.annotationsPanelAnimated = false;
       return {
-        toolbarHtml: renderCollapsedToolbar(totalAnnotationCount),
+        toolbarHtml: renderCollapsedToolbar(totalAnnotationCount, this.shortcut),
         annotationsPanelHtml: '',
       };
     }
@@ -1068,17 +1132,19 @@ export class AnnotationElement extends LitElement {
         `;
 
     return html`
-      <div
-        class="popup-popover ${this.popupShaking ? 'shake' : ''}"
-        style="left: ${position.left}px; top: ${position.top}px;"
-        data-annotation-popup
-      >
-        <div class="popup-header">
-          ${headerContent}
-          <button class="popup-close" data-action="popup-close" title="${t('popup.close')}">
-            ${unsafeHTML(icons.x)}
-          </button>
-        </div>
+      <div class="popup-popover-host" @click=${this.handleClick}>
+        <div
+          class="popup-popover ${this.popupShaking ? 'shake' : ''}"
+          style="left: ${position.left}px; top: ${position.top}px;"
+          popover="manual"
+          data-annotation-popup
+        >
+          <div class="popup-header">
+            ${headerContent}
+            <button class="popup-close" data-action="popup-close" title="${t('popup.close')}">
+              ${unsafeHTML(icons.x)}
+            </button>
+          </div>
 
         <div class="popup-body">
           <textarea
@@ -1103,6 +1169,7 @@ export class AnnotationElement extends LitElement {
           <button class="popup-btn primary" data-action="popup-submit">
             ${isEditing ? t('popup.save') : isMultiSelect ? t('popup.addAnnotations', { count: state.multiSelectInfos.length }) : t('popup.addAnnotation')}
           </button>
+        </div>
         </div>
       </div>
     `;
@@ -1244,7 +1311,6 @@ export class AnnotationElement extends LitElement {
         ${unsafeHTML(toolbarHtml)}
         ${unsafeHTML(annotationsPanelHtml)}
         ${unsafeHTML(markersHtml)}
-        ${this.renderPopupTemplate(state)}
         ${unsafeHTML(tooltipHtml)}
         ${unsafeHTML(highlightHtml)}
         ${unsafeHTML(selectionHtml)}
@@ -1271,7 +1337,7 @@ export class AnnotationElement extends LitElement {
       return;
     }
 
-    const popup = this.renderRoot?.querySelector('.popup-popover') as HTMLElement | null;
+    const popup = this.popupPortalShadow?.querySelector('.popup-popover') as HTMLElement | null;
     if (!popup) return;
 
     const rect = popup.getBoundingClientRect();
@@ -1300,6 +1366,101 @@ export class AnnotationElement extends LitElement {
     if (this.popupResizeObserver) {
       this.popupResizeObserver.disconnect();
       this.popupResizeObserver = null;
+    }
+  }
+
+  /**
+   * 懒创建 popup portal：一个 append 到 document.body 的 div，自带独立 shadow root，
+   * 并注入与主组件相同的样式（含主题变量），使 popup 脱离 host 元素的层叠上下文。
+   */
+  private ensurePopupPortal(): void {
+    if (this.popupPortal && this.popupPortalShadow) return;
+
+    const portal = document.createElement('div');
+    portal.setAttribute('data-annotation-portal', '');
+    const shadow = portal.attachShadow({ mode: 'open' });
+
+    // 注入主组件样式：复用 componentStyles（含 :host 主题变量与 .popup-popover 等样式）。
+    // Lit 3 的 CSSResult 暴露 cssText，用 <style> 注入兼容性最佳。
+    const styleEl = document.createElement('style');
+    styleEl.textContent = componentStyles.cssText;
+    shadow.appendChild(styleEl);
+
+    document.body.appendChild(portal);
+    this.popupPortal = portal;
+    this.popupPortalShadow = shadow;
+  }
+
+  /** 销毁 popup portal，从 body 移除并清空引用。 */
+  private destroyPopupPortal(): void {
+    this.hidePopupPopover();
+    this.teardownPopupObserver();
+    if (this.popupPortal) {
+      this.popupPortal.remove();
+      this.popupPortal = null;
+      this.popupPortalShadow = null;
+    }
+  }
+
+  /**
+   * 把 popup 模板渲染进 portal shadow，并进入 top layer。
+   * 在 updated() 中根据 popupVisible 调用。
+   */
+  private renderPopupIntoPortal(): void {
+    if (!this.appState) return;
+
+    if (!this.appState.popupVisible) {
+      this.hidePopupPopover();
+      return;
+    }
+
+    this.ensurePopupPortal();
+
+    // 同步主题到 portal div，让 :host([data-theme="dark"]) 在 portal shadow 内生效
+    const resolvedTheme = resolveTheme(this.appState.settings.theme);
+    this.popupPortal!.setAttribute('data-theme', resolvedTheme);
+
+    // 用 Lit 的 render() 把 popup 模板渲染进 portal shadow（脱离主 renderRoot）
+    const template = this.renderPopupTemplate(this.appState);
+    // 关键：传 { host: this }，让 Lit 的 @event 指令把 listener 内的 this 绑定到
+    // AnnotationElement 实例（与主 renderRoot 一致）。否则 this 会是 popup-popover-host 元素，
+    // handleClick 内 this.core 为 undefined，导致 popup 按钮失效。
+    render(template, this.popupPortalShadow!, { host: this });
+
+    // 进入 top layer（支持 popover 的浏览器）；不支持时降级为 body 下 fixed 定位
+    this.showPopupPopover();
+
+    // 定位 + 聚焦 textarea
+    this.syncPopupPosition();
+    if (this.textareaRef.value) {
+      requestAnimationFrame(() => this.textareaRef.value?.focus());
+    }
+  }
+
+  /** 调用 popover API 把 .popup-popover 显示到 top layer（支持的浏览器）。 */
+  private showPopupPopover(): void {
+    const el = this.popupPortalShadow?.querySelector('.popup-popover') as HTMLElement | null;
+    if (el && typeof el.showPopover === 'function') {
+      try {
+        el.showPopover();
+      } catch {
+        // 已显示或浏览器内部异常，忽略：降级到普通 fixed 显示即可
+      }
+    }
+  }
+
+  /** 隐藏 popover 并清空 portal 内容（popup 关闭时调用）。 */
+  private hidePopupPopover(): void {
+    const el = this.popupPortalShadow?.querySelector('.popup-popover') as HTMLElement | null;
+    if (el && typeof el.hidePopover === 'function') {
+      try {
+        el.hidePopover();
+      } catch {
+        // 忽略：未显示或浏览器内部异常
+      }
+    }
+    if (this.popupPortalShadow) {
+      render(nothing, this.popupPortalShadow);
     }
   }
 

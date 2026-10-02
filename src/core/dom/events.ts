@@ -14,6 +14,12 @@ const DATA_TOOLBAR = 'data-annotation-toolbar';
 const DATA_MARKER = 'data-annotation-marker';
 const DATA_POPUP = 'data-annotation-popup';
 const DATA_SETTINGS = 'data-annotation-settings';
+// popup portal 容器：popup 渲染在 document.body 下的独立 shadow DOM 内，
+// document 上的事件 target 会被 retarget 到此 div，需识别为标注 UI 以避免被 blockInteractions 拦截。
+const DATA_PORTAL = 'data-annotation-portal';
+
+/** 全部标注 UI 的 data 属性集合，用于 closest/composedPath 检测。 */
+const ANNOTATION_ATTRS = [DATA_TOOLBAR, DATA_MARKER, DATA_POPUP, DATA_SETTINGS, DATA_PORTAL];
 
 /**
  * Check if an element is part of the Annotation UI
@@ -37,7 +43,8 @@ export function isAnnotationElement(element: Element | null): boolean {
     element.hasAttribute(DATA_MARKER) ||
     element.hasAttribute(DATA_POPUP) ||
     element.hasAttribute(DATA_SETTINGS) ||
-    element.closest(`[${DATA_TOOLBAR}], [${DATA_MARKER}], [${DATA_POPUP}], [${DATA_SETTINGS}]`) !== null
+    element.hasAttribute(DATA_PORTAL) ||
+    element.closest(`[${ANNOTATION_ATTRS.join('], [')}]`) !== null
   );
 }
 
@@ -57,7 +64,8 @@ export function isAnnotationEvent(event: Event): boolean {
           target.hasAttribute(DATA_TOOLBAR) ||
           target.hasAttribute(DATA_MARKER) ||
           target.hasAttribute(DATA_POPUP) ||
-          target.hasAttribute(DATA_SETTINGS)
+          target.hasAttribute(DATA_SETTINGS) ||
+          target.hasAttribute(DATA_PORTAL)
         )) {
           return true;
         }
@@ -170,6 +178,31 @@ export function createEventHandlers(
       clickX,
       clickY
     });
+  };
+
+  /**
+   * Handle pointer down — 拦截 pointerdown 以阻止应用弹出层（Popover/Modal/Drawer 等）
+   * 在"点击外部关闭"逻辑中关闭。现代 UI 库（Radix/shadcn/Headless UI/Ant 等）普遍用
+   * pointerdown 监听 outside click，若不拦截，标注点击的瞬间弹出层就会关闭、目标消失。
+   * 行为与 handleMouseDown 对称：仅当 blockInteractions 开启且目标非标注元素时拦截。
+   */
+  const handlePointerDown = (event: PointerEvent) => {
+    const state = store.getState();
+
+    if (state.mode === 'disabled') return;
+    if (state.passthroughActive) return;
+
+    const target = event.target as Element;
+    if (isAnnotationElement(target)) return;
+
+    if (state.settings.blockInteractions) {
+      event.preventDefault();
+      // 用 stopImmediatePropagation 而非 stopPropagation：stopPropagation 在 document capture
+      // 阶段不阻止同节点上其他 capture listener（如 Radix/shadcn 的 outside-click 监听），
+      // 会让应用的弹出层在 pointerdown 瞬间被"点击外部"逻辑关闭。stopImmediatePropagation
+      // 才能阻止同节点后续 listener，真正"冻结"窗口。
+      event.stopImmediatePropagation();
+    }
   };
 
   /**
@@ -358,6 +391,7 @@ export function createEventHandlers(
     if (isActive) return;
 
     document.addEventListener('click', handleClick, true);
+    document.addEventListener('pointerdown', handlePointerDown, true);
     document.addEventListener('mousedown', handleMouseDown, true);
     document.addEventListener('mousemove', handleMouseMove, true);
     document.addEventListener('mouseup', handleMouseUp, true);
@@ -376,6 +410,7 @@ export function createEventHandlers(
     if (!isActive) return;
 
     document.removeEventListener('click', handleClick, true);
+    document.removeEventListener('pointerdown', handlePointerDown, true);
     document.removeEventListener('mousedown', handleMouseDown, true);
     document.removeEventListener('mousemove', handleMouseMove, true);
     document.removeEventListener('mouseup', handleMouseUp, true);
